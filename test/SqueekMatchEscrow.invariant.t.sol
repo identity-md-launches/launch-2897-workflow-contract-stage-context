@@ -8,7 +8,8 @@ import {MockSQK, MockSqueekCore, MockSqueekMining, MockSqueekNFT} from "./mocks/
 
 /// @notice Drives SqueekMatchEscrow with random sequences of creates, fills and cancels of all three order
 /// kinds, interleaved with the things the outside world does between them: time passing, Squeeks changing
-/// level / cooldown / pending power, Squeeks moving between wallets, approvals being revoked, SQK being sent
+/// level / cooldown / pending power, the policy's maximum level moving, Squeeks moving between wallets,
+/// approvals being revoked, SQK being sent
 /// to the escrow directly.
 ///
 /// For every escrow call the handler first predicts, from its own independent model of the order book,
@@ -38,6 +39,8 @@ contract EscrowHandler is Test {
         uint8 level;
         bool mergeReady;
         uint256 sqkFromTaker;
+        uint8 makerLevel; // ask / swap: level of the maker's Squeek when the order was created
+        uint256 tradeCountAt; // ask / swap: escrow trades of the maker's Squeek when the order was created
     }
 
     SqueekMatchEscrow public immutable escrow;
@@ -50,7 +53,8 @@ contract EscrowHandler is Test {
     uint256[] public orderIds;
     mapping(uint8 => uint256[]) internal idsOfKind;
     mapping(uint256 => GhostOrder) internal ghost;
-    mapping(uint256 => uint8) public ghostLevel;
+    /// @dev How many fills moved each Squeek; asks and swaps of an older trade count must not fill.
+    mapping(uint256 => uint256) public ghostTrades;
 
     // Ghost accounting.
     uint256 public ghostOwed; // SQK the escrow owes open bids and swaps
@@ -113,11 +117,33 @@ contract EscrowHandler is Test {
         return orderIds[seed % orderIds.length];
     }
 
-    /// @dev Mostly an order of `kind`, sometimes any order or an id never created.
+    /// @dev Mostly a still-open order of `kind` (the newest few first), sometimes any order of `kind`, any
+    /// order, or an id never created.
     function _orderIdOf(uint8 kind, uint256 seed) internal view returns (uint256) {
+        return _orderIdOf(kind, seed, true);
+    }
+
+    /// @dev As above; `preferLive` false picks uniformly among the orders of `kind` (used by cancels, so
+    /// they do not close every order before a fill can reach it).
+    function _orderIdOf(uint8 kind, uint256 seed, bool preferLive) internal view returns (uint256) {
         uint256[] storage list = idsOfKind[kind];
         if (list.length == 0 || seed % 5 == 0) return _orderId(seed / 5);
+        if (preferLive && seed % 5 != 1) {
+            uint256 skip = (seed / 5) % 3;
+            for (uint256 i = list.length; i > 0 && list.length - i < 12; --i) {
+                if (_liveOpen(ghost[list[i - 1]])) {
+                    if (skip == 0) return list[i - 1];
+                    --skip;
+                }
+            }
+        }
         return list[(seed / 5) % list.length];
+    }
+
+    /// @dev Mostly an actor other than `avoid`, sometimes any actor (so self-trades are still tried).
+    function _actorNot(uint256 seed, address avoid) internal view returns (address a) {
+        a = _actor(seed);
+        if (a == avoid && seed % 8 != 0) a = _actor(seed % actors.length + 1);
     }
 
     /// @dev Mostly the token's owner, sometimes a random actor.
@@ -172,7 +198,27 @@ contract EscrowHandler is Test {
         ISqueekMining.MiningPosition memory p = mining.position(0, tokenId);
         if (p.level == 0 || p.level != level) return false;
         if (!mergeReady) return true;
-        return p.pendingRound == 0 && p.level < MAX_LEVEL && p.nextMergeBlock <= core.blockHeight();
+        return p.pendingRound == 0 && p.level < mining.maximumLevel() && p.nextMergeBlock <= core.blockHeight();
+    }
+
+    /// @dev Whether some Squeek could ever satisfy a bid / swap's wanted level under the current policy.
+    function _fillableLevel(uint8 level, bool mergeReady) internal view returns (bool) {
+        uint8 maximum = mining.maximumLevel();
+        return level != 0 && level <= maximum && !(mergeReady && level >= maximum);
+    }
+
+    /// @dev The maker side of an ask or swap: still the maker's, not traded here since, approved, same level.
+    function _makerSideOk(GhostOrder storage g) internal view returns (bool) {
+        return _ownsAndApproved(g.tokenId, g.maker) && ghostTrades[g.tokenId] == g.tradeCountAt
+            && mining.position(0, g.tokenId).level == g.makerLevel;
+    }
+
+    /// @dev What `isFillable` must report for `id`, from the model alone.
+    function predictedFillable(uint256 id) external view returns (bool) {
+        GhostOrder storage g = ghost[id];
+        if (g.kind == 0 || !_liveOpen(g)) return false;
+        if (g.kind == BID) return true;
+        return _makerSideOk(g);
     }
 
     function _fail(string memory what) internal {
@@ -193,14 +239,17 @@ contract EscrowHandler is Test {
         address maker = _makerFor(actorSeed, tokenId);
         price = bound(price, 0, MAX_PRICE);
         duration = uint64(bound(duration, 0, 31 days));
-        bool ok = price != 0 && _durationOk(duration) && _ownsAndApproved(tokenId, maker);
+        uint8 level = mining.position(0, tokenId).level;
+        bool ok = price != 0 && _durationOk(duration) && _ownsAndApproved(tokenId, maker) && level != 0;
         uint256 expectedId = escrow.nextOrderId();
 
         vm.prank(maker);
         try escrow.createAsk(tokenId, price, duration) returns (uint256 id) {
             _check(ok, true, "createAsk");
             if (id != expectedId) _fail("createAsk: id not nextOrderId");
-            ghost[id] = GhostOrder(ASK, OPEN, maker, _expiry(duration), tokenId, price, 0, 0, false, 0);
+            ghost[id] = GhostOrder(
+                ASK, OPEN, maker, _expiry(duration), tokenId, price, 0, 0, false, 0, level, ghostTrades[tokenId]
+            );
             _push(id, ghost[id].kind);
             ++calls["createAsk"];
         } catch {
@@ -209,11 +258,11 @@ contract EscrowHandler is Test {
     }
 
     function fillAsk(uint256 actorSeed, uint256 orderSeed) external {
-        address taker = _actor(actorSeed);
         uint256 id = _orderIdOf(ASK, orderSeed);
         GhostOrder storage g = ghost[id];
-        bool ok = g.kind == ASK && _liveOpen(g) && taker != g.maker && _ownsAndApproved(g.tokenId, g.maker)
-            && sqk.balanceOf(taker) >= g.amount;
+        address taker = _actorNot(actorSeed, g.maker);
+        bool ok =
+            g.kind == ASK && _liveOpen(g) && taker != g.maker && _makerSideOk(g) && sqk.balanceOf(taker) >= g.amount;
         uint256 takerBefore = sqk.balanceOf(taker);
         uint256 makerBefore = sqk.balanceOf(g.maker);
         uint256 escrowBefore = sqk.balanceOf(address(escrow));
@@ -222,6 +271,7 @@ contract EscrowHandler is Test {
         try escrow.fillAsk(id) {
             _check(ok, true, "fillAsk");
             g.status = FILLED;
+            ++ghostTrades[g.tokenId];
             if (nft.ownerOf(g.tokenId) != taker) _fail("fillAsk: taker did not get the Squeek");
             if (sqk.balanceOf(taker) != takerBefore - g.amount) _fail("fillAsk: taker paid wrong amount");
             if (sqk.balanceOf(g.maker) != makerBefore + g.amount) _fail("fillAsk: maker paid wrong amount");
@@ -233,7 +283,7 @@ contract EscrowHandler is Test {
     }
 
     function cancelAsk(uint256 actorSeed, uint256 orderSeed) external {
-        uint256 id = _orderIdOf(ASK, orderSeed);
+        uint256 id = _orderIdOf(ASK, orderSeed, false);
         GhostOrder storage g = ghost[id];
         address caller = actorSeed % 2 == 0 && g.maker != address(0) ? g.maker : _actor(actorSeed);
         bool ok = g.kind == ASK && g.status == OPEN && (caller == g.maker || block.timestamp >= g.expiresAt);
@@ -259,7 +309,8 @@ contract EscrowHandler is Test {
         level = _levelFor(uint256(keccak256(abi.encode(level, actorSeed))));
         amount = bound(amount, 0, MAX_PRICE);
         duration = uint64(bound(duration, 0, 31 days));
-        bool ok = amount != 0 && level != 0 && _durationOk(duration) && sqk.balanceOf(maker) >= amount;
+        bool ok =
+            amount != 0 && _fillableLevel(level, mergeReady) && _durationOk(duration) && sqk.balanceOf(maker) >= amount;
         uint256 expectedId = escrow.nextOrderId();
         uint256 escrowBefore = sqk.balanceOf(address(escrow));
 
@@ -268,7 +319,7 @@ contract EscrowHandler is Test {
             _check(ok, true, "createBid");
             if (id != expectedId) _fail("createBid: id not nextOrderId");
             if (sqk.balanceOf(address(escrow)) != escrowBefore + amount) _fail("createBid: wrong escrow amount");
-            ghost[id] = GhostOrder(BID, OPEN, maker, _expiry(duration), 0, amount, 0, level, mergeReady, 0);
+            ghost[id] = GhostOrder(BID, OPEN, maker, _expiry(duration), 0, amount, 0, level, mergeReady, 0, 0, 0);
             _push(id, ghost[id].kind);
             ghostOwed += amount;
             ghostEscrowedIn += amount;
@@ -294,6 +345,7 @@ contract EscrowHandler is Test {
         try escrow.fillBid(id, tokenId) {
             _check(ok, true, "fillBid");
             g.status = FILLED;
+            ++ghostTrades[tokenId];
             ghostOwed -= g.amount;
             ghostEscrowedOut += g.amount;
             if (nft.ownerOf(tokenId) != g.maker) _fail("fillBid: maker did not get the Squeek");
@@ -306,7 +358,7 @@ contract EscrowHandler is Test {
     }
 
     function cancelBid(uint256 actorSeed, uint256 orderSeed) external {
-        uint256 id = _orderIdOf(BID, orderSeed);
+        uint256 id = _orderIdOf(BID, orderSeed, false);
         GhostOrder storage g = ghost[id];
         address caller = actorSeed % 2 == 0 && g.maker != address(0) ? g.maker : _actor(actorSeed);
         bool ok = g.kind == BID && g.status == OPEN && (caller == g.maker || block.timestamp >= g.expiresAt);
@@ -341,31 +393,51 @@ contract EscrowHandler is Test {
         uint256 difference,
         uint8 payMode,
         uint64 duration
-    ) external {
+    ) public returns (uint256) {
         GhostOrder memory o;
         o.kind = SWAP;
         o.status = OPEN;
         o.tokenId = _token(tokenSeed);
         o.maker = _makerFor(actorSeed, o.tokenId);
-        // 0 = ANY_SQUEEK, otherwise a specific id (possibly the maker's own token, which must revert).
-        o.wantedTokenId = wantedSeed % (NUM_TOKENS + 1);
+        // Half the time ANY_SQUEEK (0), otherwise a specific id (possibly the maker's own, which must revert).
+        o.wantedTokenId = wantedSeed % 2 == 0 ? 0 : (wantedSeed / 2) % (NUM_TOKENS + 1);
         o.level = _levelFor(uint256(keccak256(abi.encode(level, wantedSeed))));
         // A named wanted Squeek is usually asked for at its current level.
         if (o.wantedTokenId != 0 && level % 4 != 0) o.level = mining.position(0, o.wantedTokenId).level;
         o.mergeReady = mergeReady;
         difference = bound(difference, 1, MAX_PRICE);
-        // 0: no difference, 1: maker pays, 2: taker pays, 3: both pay (must revert)
-        payMode = payMode % 4;
+        // 0: no difference, 1: maker pays, 2: taker pays, 3: both pay (must revert, so tried less often)
+        payMode = payMode % 8 == 7 ? 3 : payMode % 3;
         o.amount = payMode == 1 || payMode == 3 ? difference : 0;
         o.sqkFromTaker = payMode == 2 || payMode == 3 ? difference : 0;
         duration = uint64(bound(duration, 0, 31 days));
         o.expiresAt = _expiry(duration);
-        bool ok = o.level != 0 && o.wantedTokenId != o.tokenId && payMode != 3 && _durationOk(duration)
-            && _ownsAndApproved(o.tokenId, o.maker) && sqk.balanceOf(o.maker) >= o.amount;
-        _createSwap(o, duration, ok);
+        o.makerLevel = mining.position(0, o.tokenId).level;
+        o.tradeCountAt = ghostTrades[o.tokenId];
+        bool ok = _fillableLevel(o.level, o.mergeReady) && o.wantedTokenId != o.tokenId && payMode != 3
+            && _durationOk(duration) && _ownsAndApproved(o.tokenId, o.maker) && o.makerLevel != 0
+            && sqk.balanceOf(o.maker) >= o.amount;
+        return _createSwap(o, duration, ok);
     }
 
-    function _createSwap(GhostOrder memory o, uint64 duration, bool ok) internal {
+    /// @dev A swap made and then taken straight away (in two separate escrow calls), so the swap fill path
+    /// is reached in most runs rather than only when a random fill happens to find a live swap. The taker is
+    /// mostly the owner of a Squeek at the wanted level; the model still predicts both outcomes.
+    function createThenFillSwap(
+        uint256 actorSeed,
+        uint256 tokenSeed,
+        uint256 wantedSeed,
+        uint8 level,
+        bool mergeReady,
+        uint256 difference,
+        uint8 payMode,
+        uint256 takerSeed
+    ) external {
+        uint256 id = createSwap(actorSeed, tokenSeed, wantedSeed, level, mergeReady, difference, payMode, 0);
+        if (id != 0) _fillSwap(takerSeed, id, takerSeed / 7);
+    }
+
+    function _createSwap(GhostOrder memory o, uint64 duration, bool ok) internal returns (uint256) {
         uint256 expectedId = escrow.nextOrderId();
         uint256 escrowBefore = sqk.balanceOf(address(escrow));
 
@@ -384,20 +456,25 @@ contract EscrowHandler is Test {
             ghostEscrowedIn += o.amount;
             ghostMakerIn[o.maker] += o.amount;
             ++calls["createSwap"];
+            return id;
         } catch {
             _check(ok, false, "createSwap");
         }
+        return 0;
     }
 
     function fillSwap(uint256 actorSeed, uint256 orderSeed, uint256 tokenSeed) external {
-        uint256 id = _orderIdOf(SWAP, orderSeed);
+        _fillSwap(actorSeed, _orderIdOf(SWAP, orderSeed), tokenSeed);
+    }
+
+    function _fillSwap(uint256 actorSeed, uint256 id, uint256 tokenSeed) internal {
         GhostOrder storage g = ghost[id];
         // Mostly offer the wanted token when the swap names one.
         uint256 tokenId =
             g.wantedTokenId != 0 && tokenSeed % 4 != 0 ? g.wantedTokenId : _tokenFor(tokenSeed, g.level, g.maker);
         address taker = actorSeed % 4 == 0 ? _actor(actorSeed / 4) : nft.ownerOf(tokenId);
         bool ok = g.kind == SWAP && _liveOpen(g) && taker != g.maker
-            && (g.wantedTokenId == 0 || g.wantedTokenId == tokenId) && _ownsAndApproved(g.tokenId, g.maker)
+            && (g.wantedTokenId == 0 || g.wantedTokenId == tokenId) && _makerSideOk(g)
             && _ownsAndApproved(tokenId, taker) && _matches(tokenId, g.level, g.mergeReady)
             && sqk.balanceOf(taker) >= g.sqkFromTaker;
         uint256 takerBefore = sqk.balanceOf(taker);
@@ -408,6 +485,8 @@ contract EscrowHandler is Test {
         try escrow.fillSwap(id, tokenId) {
             _check(ok, true, "fillSwap");
             g.status = FILLED;
+            ++ghostTrades[g.tokenId];
+            ++ghostTrades[tokenId];
             ghostOwed -= g.amount;
             ghostEscrowedOut += g.amount;
             if (nft.ownerOf(tokenId) != g.maker) _fail("fillSwap: maker did not get taker's Squeek");
@@ -422,7 +501,7 @@ contract EscrowHandler is Test {
     }
 
     function cancelSwap(uint256 actorSeed, uint256 orderSeed) external {
-        uint256 id = _orderIdOf(SWAP, orderSeed);
+        uint256 id = _orderIdOf(SWAP, orderSeed, false);
         GhostOrder storage g = ghost[id];
         address caller = actorSeed % 2 == 0 && g.maker != address(0) ? g.maker : _actor(actorSeed);
         bool ok = g.kind == SWAP && g.status == OPEN && (caller == g.maker || block.timestamp >= g.expiresAt);
@@ -450,17 +529,27 @@ contract EscrowHandler is Test {
 
     /// @dev Mostly short steps so orders are often still live; sometimes a jump past any expiry.
     function warp(uint256 seconds_) external {
-        vm.warp(block.timestamp + (seconds_ % 8 == 0 ? bound(seconds_, 7 days, 31 days) : bound(seconds_, 1, 12 hours)));
+        vm.warp(
+            block.timestamp + (seconds_ % 16 == 0 ? bound(seconds_, 7 days, 31 days) : bound(seconds_, 1, 12 hours))
+        );
     }
 
-    /// @dev Changes a Squeek's live position: sometimes no live position, sometimes a pending power change
-    /// or a cooldown that the core height may not have reached.
+    /// @dev Changes a Squeek's live position: sometimes no live position or a new level (a merge or burn),
+    /// otherwise the same level with a pending power change or a cooldown the core height may not have reached.
     function setPosition(uint256 tokenSeed, uint8 level, uint40 pendingRound, uint48 nextMergeBlock) external {
         uint256 tokenId = _token(tokenSeed);
-        level = level % 8 == 0 ? 0 : uint8(bound(level, 1, MAX_LEVEL));
+        uint8 current = mining.position(0, tokenId).level;
+        if (level % 8 == 0) level = 0;
+        else if (level % 8 == 4 || current == 0) level = uint8(bound(level, 1, MAX_LEVEL));
+        else level = current;
         pendingRound = pendingRound % 4 == 0 ? pendingRound : 0;
         nextMergeBlock = uint48(bound(nextMergeBlock, 0, 130));
         mining.setPosition(tokenId, level, pendingRound, nextMergeBlock);
+    }
+
+    /// @dev Moves the collection's maximum level (a policy change), mostly back to the default.
+    function setMaximumLevel(uint8 maximum) external {
+        mining.setMaximumLevel(maximum % 8 == 0 ? uint8(bound(maximum, 2, MAX_LEVEL)) : MAX_LEVEL);
     }
 
     function setCoreHeight(uint64 height) external {
@@ -557,7 +646,7 @@ contract SqueekMatchEscrowInvariantTest is Test {
                 (,, SqueekMatchEscrow.Status s,,, uint256 amount) = escrow.bids(id);
                 if (s == SqueekMatchEscrow.Status.Open) owedFromStorage += amount;
             } else if (kind == SqueekMatchEscrow.Kind.Swap) {
-                (,, SqueekMatchEscrow.Status s,,,,, uint256 fromMaker,) = escrow.swaps(id);
+                (,, SqueekMatchEscrow.Status s,,,,,, uint256 fromMaker,,) = escrow.swaps(id);
                 if (s == SqueekMatchEscrow.Status.Open) owedFromStorage += fromMaker;
             }
         }
@@ -612,48 +701,74 @@ contract SqueekMatchEscrowInvariantTest is Test {
             EscrowHandler.GhostOrder memory g = handler.ghostOrder(id);
             assertEq(uint8(escrow.kindOf(id)), g.kind, "kind");
             uint8 status;
-            if (g.kind == 1) {
-                (address maker, uint64 expiresAt, SqueekMatchEscrow.Status s, uint256 tokenId, uint256 price) =
-                    escrow.asks(id);
-                status = uint8(s);
-                assertEq(maker, g.maker);
-                assertEq(expiresAt, g.expiresAt);
-                assertEq(tokenId, g.tokenId);
-                assertEq(price, g.amount);
-            } else if (g.kind == 2) {
-                (address maker, uint64 expiresAt, SqueekMatchEscrow.Status s, uint8 level, bool mr, uint256 amount) =
-                    escrow.bids(id);
-                status = uint8(s);
-                assertEq(maker, g.maker);
-                assertEq(expiresAt, g.expiresAt);
-                assertEq(level, g.level);
-                assertEq(mr, g.mergeReady);
-                assertEq(amount, g.amount);
-            } else {
-                (
-                    address maker,
-                    uint64 expiresAt,
-                    SqueekMatchEscrow.Status s,
-                    uint8 level,
-                    bool mr,
-                    uint256 makerTokenId,
-                    uint256 wanted,
-                    uint256 fromMaker,
-                    uint256 fromTaker
-                ) = escrow.swaps(id);
-                status = uint8(s);
-                assertEq(maker, g.maker);
-                assertEq(expiresAt, g.expiresAt);
-                assertEq(level, g.level);
-                assertEq(mr, g.mergeReady);
-                assertEq(makerTokenId, g.tokenId);
-                assertEq(wanted, g.wantedTokenId);
-                assertEq(fromMaker, g.amount);
-                assertEq(fromTaker, g.sqkFromTaker);
-            }
+            if (g.kind == 1) status = _checkAsk(id, g);
+            else if (g.kind == 2) status = _checkBid(id, g);
+            else status = _checkSwap(id, g);
             // The ghost status only moves Open -> Filled|Cancelled, so equality means no order reopened.
             assertEq(status, g.status, "status diverged from model");
             assertEq(escrow.isOpen(id), g.status == 1 && block.timestamp < g.expiresAt, "isOpen");
+            assertEq(escrow.isFillable(id), handler.predictedFillable(id), "isFillable diverged from model");
         }
+        for (uint256 t = 1; t <= 12; ++t) {
+            assertEq(escrow.tradeCount(t), handler.ghostTrades(t), "tradeCount diverged from model");
+        }
+    }
+
+    function _checkAsk(uint256 id, EscrowHandler.GhostOrder memory g) internal view returns (uint8) {
+        (
+            address maker,
+            uint64 expiresAt,
+            SqueekMatchEscrow.Status s,
+            uint8 level,
+            uint256 tokenId,
+            uint256 price,
+            uint256 tradeCountAt
+        ) = escrow.asks(id);
+        assertEq(maker, g.maker);
+        assertEq(expiresAt, g.expiresAt);
+        assertEq(level, g.makerLevel, "ask level");
+        assertEq(tokenId, g.tokenId);
+        assertEq(price, g.amount);
+        assertEq(tradeCountAt, g.tradeCountAt, "ask tradeCount");
+        return uint8(s);
+    }
+
+    function _checkBid(uint256 id, EscrowHandler.GhostOrder memory g) internal view returns (uint8) {
+        (address maker, uint64 expiresAt, SqueekMatchEscrow.Status s, uint8 level, bool mr, uint256 amount) =
+            escrow.bids(id);
+        assertEq(maker, g.maker);
+        assertEq(expiresAt, g.expiresAt);
+        assertEq(level, g.level);
+        assertEq(mr, g.mergeReady);
+        assertEq(amount, g.amount);
+        return uint8(s);
+    }
+
+    function _checkSwap(uint256 id, EscrowHandler.GhostOrder memory g) internal view returns (uint8) {
+        (
+            address maker,
+            uint64 expiresAt,
+            SqueekMatchEscrow.Status s,
+            uint8 wantedLevel,
+            bool mr,
+            uint8 makerLevel,,,,,
+        ) = escrow.swaps(id);
+        assertEq(maker, g.maker);
+        assertEq(expiresAt, g.expiresAt);
+        assertEq(wantedLevel, g.level);
+        assertEq(mr, g.mergeReady);
+        assertEq(makerLevel, g.makerLevel, "swap makerLevel");
+        _checkSwapAmounts(id, g);
+        return uint8(s);
+    }
+
+    function _checkSwapAmounts(uint256 id, EscrowHandler.GhostOrder memory g) internal view {
+        (,,,,,, uint256 makerTokenId, uint256 wanted, uint256 fromMaker, uint256 fromTaker, uint256 tradeCountAt) =
+            escrow.swaps(id);
+        assertEq(makerTokenId, g.tokenId);
+        assertEq(wanted, g.wantedTokenId);
+        assertEq(fromMaker, g.amount);
+        assertEq(fromTaker, g.sqkFromTaker);
+        assertEq(tradeCountAt, g.tradeCountAt, "swap tradeCount");
     }
 }

@@ -243,21 +243,49 @@ contract SqueekMatchEscrowEdgeTest is SqueekMatchEscrowTestBase {
         escrow.fillSwap(swapId, UNKNOWN);
     }
 
-    /// Whatever the contract decides about a level above the collection's maximum, the maker's SQK must
-    /// never be stuck: either creation reverts, or the order can never fill and the refund is complete.
-    function test_bidAboveMaximumLevel_neverFillsAndIsFullyRefundable() public {
+    /// A level above the collection's maximum is rejected at creation, so no SQK is ever escrowed for a bid
+    /// that could never fill.
+    function test_bidAboveMaximumLevel_rejectedBeforeEscrow() public {
         uint8 tooHigh = mining.MAXIMUM_LEVEL() + 1;
-        mining.setPosition(B1, mining.MAXIMUM_LEVEL(), 0, 0);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
         vm.prank(alice);
-        try escrow.createBid(tooHigh, false, 100 ether, 0) returns (uint256 bidId) {
-            vm.expectRevert(
-                abi.encodeWithSelector(SqueekMatchEscrow.LevelMismatch.selector, B1, tooHigh, mining.MAXIMUM_LEVEL())
-            );
-            vm.prank(bob);
-            escrow.fillBid(bidId, B1);
-            vm.prank(alice);
-            escrow.cancelBid(bidId);
-        } catch {}
+        escrow.createBid(tooHigh, false, 100 ether, 0);
+        assertEq(sqk.balanceOf(alice), INITIAL_SQK);
+        assertEq(sqk.balanceOf(address(escrow)), 0);
+        assertEq(escrow.nextOrderId(), 1, "no id consumed");
+    }
+
+    /// The maximum level is read from the live policy: once it is lowered, levels above it are rejected.
+    function test_createBid_followsALoweredMaximumLevel() public {
+        mining.setMaximumLevel(5);
+        vm.startPrank(alice);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createBid(6, false, 1 ether, 0);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createBid(5, true, 1 ether, 0);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createSwap(A1, 0, 6, false, 0, 0, 0);
+        escrow.createBid(5, false, 1 ether, 0);
+        escrow.createBid(4, true, 1 ether, 0);
+        vm.stopPrank();
+        assertEq(sqk.balanceOf(address(escrow)), 2 ether);
+    }
+
+    /// A merge-ready bid made below the maximum cannot be filled once the policy lowers the maximum to its
+    /// level (such a Squeek can no longer merge); the escrowed SQK stays fully refundable.
+    function test_mergeReadyBid_maximumLoweredToItsLevel_blocksFill_refundable() public {
+        vm.prank(alice);
+        uint256 bidId = escrow.createBid(3, true, 40 ether, 0);
+        mining.setMaximumLevel(3);
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.AtMaximumLevel.selector, B3, 3));
+        vm.prank(bob);
+        escrow.fillBid(bidId, B3);
+        assertFalse(escrow.isMergeReady(B3));
+        assertEq(nft.ownerOf(B3), bob);
+
+        vm.prank(alice);
+        escrow.cancelBid(bidId);
         assertEq(sqk.balanceOf(alice), INITIAL_SQK);
         assertEq(sqk.balanceOf(address(escrow)), 0);
     }
@@ -303,6 +331,86 @@ contract SqueekMatchEscrowEdgeTest is SqueekMatchEscrowTestBase {
         vm.prank(bob);
         escrow.fillBid(bidId, B1);
         assertEq(nft.ownerOf(B1), alice);
+    }
+
+    /// A swap whose offered Squeek the maker sold through one of its own asks cannot fill, and the SQK it
+    /// escrowed stays refundable; once the Squeek is bought back here the swap is stale, not revived.
+    function test_swapWithEscrowedSqk_makerSqueekSoldAndBoughtBack_staleAndRefundable() public {
+        vm.startPrank(alice);
+        uint256 swapId = escrow.createSwap(A1, 0, 1, false, 25 ether, 0, 30 days);
+        uint256 askId = escrow.createAsk(A1, 3 ether, 0);
+        vm.stopPrank();
+        vm.prank(carol);
+        escrow.fillAsk(askId);
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.MakerNoLongerOwns.selector, swapId, A1));
+        vm.prank(bob);
+        escrow.fillSwap(swapId, B1);
+
+        vm.prank(carol);
+        uint256 backId = escrow.createAsk(A1, 4 ether, 0);
+        vm.prank(alice);
+        escrow.fillAsk(backId);
+        assertEq(nft.ownerOf(A1), alice);
+        assertTrue(escrow.isOpen(swapId));
+        assertFalse(escrow.isFillable(swapId));
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.StaleOrder.selector, swapId, A1));
+        vm.prank(bob);
+        escrow.fillSwap(swapId, B1);
+        assertEq(nft.ownerOf(B1), bob);
+
+        uint256 aliceBefore = sqk.balanceOf(alice);
+        vm.warp(block.timestamp + 30 days);
+        vm.prank(bob);
+        escrow.cancelSwap(swapId);
+        assertEq(sqk.balanceOf(alice), aliceBefore + 25 ether, "escrowed difference refunded to the maker");
+        assertEq(sqk.balanceOf(address(escrow)), 0);
+        _assertNoSqkLost();
+    }
+
+    /// Selling a Squeek as the *taker* of a bid also counts as a trade: the seller's earlier swap offering
+    /// that Squeek is stale even after the Squeek returns through the escrow.
+    function test_takerSideTrade_makesSellersOwnSwapStale() public {
+        vm.prank(bob);
+        uint256 bobSwap = escrow.createSwap(B1, 0, 2, false, 0, 0, 0);
+        vm.prank(alice);
+        uint256 aliceBid = escrow.createBid(1, false, 10 ether, 0);
+        vm.prank(bob);
+        escrow.fillBid(aliceBid, B1);
+        assertEq(escrow.tradeCount(B1), 1);
+        vm.prank(alice);
+        uint256 aliceAsk = escrow.createAsk(B1, 11 ether, 0);
+        vm.prank(bob);
+        escrow.fillAsk(aliceAsk);
+        assertEq(nft.ownerOf(B1), bob);
+        assertEq(escrow.tradeCount(B1), 2);
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.StaleOrder.selector, bobSwap, B1));
+        vm.prank(alice);
+        escrow.fillSwap(bobSwap, A2);
+        assertEq(nft.ownerOf(A2), alice);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    /// An ask fills only while its Squeek's live level is exactly the listed one; any other live level
+    /// (including 0, a cleared position) reverts with the listed and live levels, and moves nothing.
+    function testFuzz_askLevelBinding(uint8 listed, uint8 live) public {
+        listed = uint8(bound(listed, 1, mining.MAXIMUM_LEVEL()));
+        live = uint8(bound(live, 0, mining.MAXIMUM_LEVEL()));
+        mining.setPosition(A1, listed, 0, 0);
+        vm.prank(alice);
+        uint256 askId = escrow.createAsk(A1, 9 ether, 0);
+        mining.setPosition(A1, live, 0, 0);
+
+        assertEq(escrow.isFillable(askId), live == listed);
+        if (live != listed) {
+            vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.LevelMismatch.selector, A1, listed, live));
+        }
+        vm.prank(bob);
+        escrow.fillAsk(askId);
+        assertEq(nft.ownerOf(A1), live == listed ? bob : alice);
+        assertEq(sqk.balanceOf(bob), live == listed ? INITIAL_SQK - 9 ether : INITIAL_SQK);
     }
 
     // ---------------------------------------------------------------------------------------------
