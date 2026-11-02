@@ -120,12 +120,22 @@
         "internalType": "enum SqueekMatchEscrow.Status"
       },
       {
+        "name": "level",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
         "name": "tokenId",
         "type": "uint256",
         "internalType": "uint256"
       },
       {
         "name": "price",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "tradeCount",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -378,6 +388,25 @@
   },
   {
     "type": "function",
+    "name": "isFillable",
+    "inputs": [
+      {
+        "name": "orderId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "isMergeReady",
     "inputs": [
       {
@@ -515,6 +544,11 @@
         "internalType": "bool"
       },
       {
+        "name": "makerLevel",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
         "name": "makerTokenId",
         "type": "uint256",
         "internalType": "uint256"
@@ -531,6 +565,30 @@
       },
       {
         "name": "sqkFromTaker",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "tradeCount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "tradeCount",
+    "inputs": [
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -583,6 +641,12 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      },
+      {
+        "name": "level",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
       },
       {
         "name": "price",
@@ -799,6 +863,12 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      },
+      {
+        "name": "makerLevel",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
       },
       {
         "name": "wantedTokenId",
@@ -1110,6 +1180,22 @@
     "type": "error",
     "name": "SelfTrade",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "StaleOrder",
+    "inputs": [
+      {
+        "name": "orderId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

@@ -7,7 +7,13 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {SqueekMatchEscrow} from "../src/SqueekMatchEscrow.sol";
 import {ISqueekMining} from "../src/interfaces/ISqueekchain.sol";
 import {MockSQK, MockSqueekCore, MockSqueekMining, MockSqueekNFT} from "./mocks/SqueekchainMocks.sol";
-import {NonReceiver, ReentrantAskTaker, ReentrantBidMaker, ReentrantSwapMaker} from "./mocks/Attackers.sol";
+import {
+    ClaimingSwapMaker,
+    NonReceiver,
+    ReentrantAskTaker,
+    ReentrantBidMaker,
+    ReentrantSwapMaker
+} from "./mocks/Attackers.sol";
 
 contract SqueekMatchEscrowTestBase is Test {
     MockSQK internal sqk;
@@ -123,22 +129,57 @@ contract SqueekMatchEscrowDeployTest is SqueekMatchEscrowTestBase {
 contract SqueekMatchEscrowAskTest is SqueekMatchEscrowTestBase {
     function test_createAsk_success() public {
         vm.expectEmit(true, true, true, true);
-        emit SqueekMatchEscrow.AskCreated(1, alice, A1, 500 ether, uint64(block.timestamp + 7 days));
+        emit SqueekMatchEscrow.AskCreated(1, alice, A1, 1, 500 ether, uint64(block.timestamp + 7 days));
         vm.prank(alice);
         uint256 id = escrow.createAsk(A1, 500 ether, 0);
 
         assertEq(id, 1);
         assertEq(uint8(escrow.kindOf(id)), uint8(SqueekMatchEscrow.Kind.Ask));
-        (address maker, uint64 expiresAt, SqueekMatchEscrow.Status status, uint256 tokenId, uint256 price) =
-            escrow.asks(id);
+        (
+            address maker,
+            uint64 expiresAt,
+            SqueekMatchEscrow.Status status,
+            uint8 level,
+            uint256 tokenId,
+            uint256 price,
+            uint256 tradeCountAt
+        ) = escrow.asks(id);
         assertEq(maker, alice);
         assertEq(expiresAt, block.timestamp + 7 days);
         assertEq(uint8(status), uint8(SqueekMatchEscrow.Status.Open));
+        assertEq(level, 1, "level recorded at listing");
         assertEq(tokenId, A1);
         assertEq(price, 500 ether);
+        assertEq(tradeCountAt, 0, "trade count recorded at listing");
         assertEq(nft.ownerOf(A1), alice, "Squeek stays in the maker's wallet");
         assertTrue(escrow.isOpen(id));
+        assertTrue(escrow.isFillable(id));
         assertEq(escrow.nextOrderId(), 2);
+    }
+
+    function test_createAsk_recordsCurrentLevelAndTradeCount() public {
+        mining.setPosition(A2, 7, 0, 0);
+        vm.prank(alice);
+        uint256 id = escrow.createAsk(A2, 1 ether, 0);
+        (,,, uint8 level,,,) = escrow.asks(id);
+        assertEq(level, 7);
+
+        // After the Squeek has traded through the escrow once, a new listing records the new count.
+        vm.prank(bob);
+        escrow.fillAsk(id);
+        assertEq(escrow.tradeCount(A2), 1);
+        vm.prank(bob);
+        uint256 relist = escrow.createAsk(A2, 2 ether, 0);
+        (,,,,,, uint256 tradeCountAt) = escrow.asks(relist);
+        assertEq(tradeCountAt, 1);
+        assertTrue(escrow.isFillable(relist));
+    }
+
+    function test_createAsk_revertsNoLivePosition() public {
+        mining.clearPosition(A1);
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.NoLivePosition.selector, A1));
+        vm.prank(alice);
+        escrow.createAsk(A1, 1 ether, 0);
     }
 
     function test_createAsk_customAndMaxDuration() public {
@@ -146,8 +187,8 @@ contract SqueekMatchEscrowAskTest is SqueekMatchEscrowTestBase {
         uint256 id1 = escrow.createAsk(A1, 1, 1 days);
         uint256 id2 = escrow.createAsk(A2, 1, 30 days);
         vm.stopPrank();
-        (, uint64 e1,,,) = escrow.asks(id1);
-        (, uint64 e2,,,) = escrow.asks(id2);
+        (, uint64 e1,,,,,) = escrow.asks(id1);
+        (, uint64 e2,,,,,) = escrow.asks(id2);
         assertEq(e1, block.timestamp + 1 days);
         assertEq(e2, block.timestamp + 30 days);
     }
@@ -200,10 +241,127 @@ contract SqueekMatchEscrowAskTest is SqueekMatchEscrowTestBase {
         assertEq(sqk.balanceOf(alice), INITIAL_SQK + 500 ether);
         assertEq(sqk.balanceOf(bob), INITIAL_SQK - 500 ether);
         assertEq(sqk.balanceOf(address(escrow)), 0, "asks never escrow anything");
-        (,, SqueekMatchEscrow.Status status,,) = escrow.asks(id);
+        (,, SqueekMatchEscrow.Status status,,,,) = escrow.asks(id);
         assertEq(uint8(status), uint8(SqueekMatchEscrow.Status.Filled));
         assertFalse(escrow.isOpen(id));
+        assertFalse(escrow.isFillable(id));
+        assertEq(escrow.tradeCount(A1), 1, "fill counts one trade of the Squeek");
         _assertNoSqkLost();
+    }
+
+    function test_fillAsk_revertsWhenMakerMergedIntoTheListedSqueek() public {
+        // Alice lists her lone level-1 Squeek, finds a partner elsewhere and merges A2 into A1 as survivor.
+        vm.prank(alice);
+        uint256 id = escrow.createAsk(A1, 100 ether, 0);
+        // SqueekMining.merge keeps the survivor's id and owner, raises its level and burns only the donor: no
+        // ERC-721 transfer touches A1, so the escrow's approval for it survives and the ask is still Open.
+        nft.burn(A2);
+        mining.clearPosition(A2);
+        mining.setPosition(A1, 2, 0, 0);
+        assertTrue(escrow.isOpen(id));
+        assertFalse(escrow.isFillable(id), "isFillable sees the level change");
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.LevelMismatch.selector, A1, 1, 2));
+        vm.prank(bob);
+        escrow.fillAsk(id);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(sqk.balanceOf(bob), INITIAL_SQK);
+
+        // The maker relists at the new level and that listing fills.
+        vm.startPrank(alice);
+        escrow.cancelAsk(id);
+        uint256 relist = escrow.createAsk(A1, 300 ether, 0);
+        vm.stopPrank();
+        (,,, uint8 level,,,) = escrow.asks(relist);
+        assertEq(level, 2);
+        vm.prank(bob);
+        escrow.fillAsk(relist);
+        assertEq(nft.ownerOf(A1), bob);
+        assertEq(sqk.balanceOf(alice), INITIAL_SQK + 300 ether);
+    }
+
+    function test_fillAsk_revertsAfterTheSqueekTradedHereAndCameBack() public {
+        // Alice lists A1 for 1 SQK (and forgets it), sells A1 into Bob's 5 SQK bid, then buys it back from Bob's
+        // 6 SQK ask. Her forgotten listing must not revive under her standing setApprovalForAll.
+        vm.prank(alice);
+        uint256 oldAsk = escrow.createAsk(A1, 1 ether, 30 days);
+        vm.prank(bob);
+        uint256 bobBid = escrow.createBid(1, false, 5 ether, 0);
+        vm.prank(alice);
+        escrow.fillBid(bobBid, A1);
+        assertEq(nft.ownerOf(A1), bob);
+        assertEq(escrow.tradeCount(A1), 1);
+        assertFalse(escrow.isFillable(oldAsk));
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.MakerNoLongerOwns.selector, oldAsk, A1));
+        vm.prank(carol);
+        escrow.fillAsk(oldAsk);
+
+        vm.prank(bob);
+        uint256 bobAsk = escrow.createAsk(A1, 6 ether, 0);
+        vm.prank(alice);
+        escrow.fillAsk(bobAsk);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(escrow.tradeCount(A1), 2);
+        assertTrue(escrow.isOpen(oldAsk), "status alone still says Open");
+        assertFalse(escrow.isFillable(oldAsk), "but the order is stale");
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.StaleOrder.selector, oldAsk, A1));
+        vm.prank(carol);
+        escrow.fillAsk(oldAsk);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(sqk.balanceOf(carol), INITIAL_SQK);
+
+        // The maker can still cancel the stale order, and a fresh listing fills normally.
+        vm.startPrank(alice);
+        escrow.cancelAsk(oldAsk);
+        uint256 fresh = escrow.createAsk(A1, 7 ether, 0);
+        vm.stopPrank();
+        vm.prank(carol);
+        escrow.fillAsk(fresh);
+        assertEq(nft.ownerOf(A1), carol);
+        _assertNoSqkLost();
+    }
+
+    function test_fillAsk_revertsAfterTheSqueekTradedHereViaSwapAndCameBack() public {
+        // Same revival through swaps: A1 leaves in a swap and returns in another swap.
+        vm.prank(alice);
+        uint256 oldAsk = escrow.createAsk(A1, 1 ether, 30 days);
+        vm.prank(bob);
+        uint256 swap1 = escrow.createSwap(B1, A1, 1, false, 0, 0, 0);
+        vm.prank(alice);
+        escrow.fillSwap(swap1, A1);
+        assertEq(nft.ownerOf(A1), bob);
+        vm.prank(alice);
+        uint256 swap2 = escrow.createSwap(B1, A1, 1, false, 0, 0, 0);
+        vm.prank(bob);
+        escrow.fillSwap(swap2, A1);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(escrow.tradeCount(A1), 2);
+        assertEq(escrow.tradeCount(B1), 2);
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.StaleOrder.selector, oldAsk, A1));
+        vm.prank(carol);
+        escrow.fillAsk(oldAsk);
+        assertEq(nft.ownerOf(A1), alice);
+    }
+
+    function test_fillAsk_transferOutsideTheEscrowAndBackStillNeedsCancel() public {
+        // Documented limit: a transfer the escrow does not perform does not bump the trade count. The maker
+        // must cancel; until then the live checks (owner, approval, level) are all that protect the order.
+        vm.prank(alice);
+        uint256 id = escrow.createAsk(A1, 1 ether, 0);
+        vm.prank(alice);
+        nft.transferFrom(alice, carol, A1);
+        vm.prank(carol);
+        nft.transferFrom(carol, alice, A1);
+        assertEq(escrow.tradeCount(A1), 0);
+        assertTrue(escrow.isFillable(id));
+        vm.prank(alice);
+        escrow.cancelAsk(id);
+        assertFalse(escrow.isFillable(id));
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.OrderNotOpen.selector, id));
+        vm.prank(bob);
+        escrow.fillAsk(id);
     }
 
     function test_fillAsk_atLastSecondBeforeExpiry() public {
@@ -329,7 +487,7 @@ contract SqueekMatchEscrowAskTest is SqueekMatchEscrowTestBase {
         emit SqueekMatchEscrow.AskCancelled(id, alice, false);
         vm.prank(alice);
         escrow.cancelAsk(id);
-        (,, SqueekMatchEscrow.Status status,,) = escrow.asks(id);
+        (,, SqueekMatchEscrow.Status status,,,,) = escrow.asks(id);
         assertEq(uint8(status), uint8(SqueekMatchEscrow.Status.Cancelled));
         vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.OrderNotOpen.selector, id));
         vm.prank(bob);
@@ -431,6 +589,25 @@ contract SqueekMatchEscrowBidTest is SqueekMatchEscrowTestBase {
         vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
         vm.prank(alice);
         escrow.createBid(0, false, 1 ether, 0);
+    }
+
+    function test_createBid_revertsLevelNoSqueekCanHave() public {
+        uint8 max = mining.MAXIMUM_LEVEL();
+        vm.startPrank(alice);
+        // Above the collection's maximum level: no Squeek could ever match.
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createBid(max + 1, false, 1 ether, 0);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createBid(type(uint8).max, true, 1 ether, 0);
+        // Merge-ready at the maximum level: a Squeek there can never merge.
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createBid(max, true, 1 ether, 0);
+        // The boundaries that are satisfiable are accepted.
+        escrow.createBid(max, false, 1 ether, 0);
+        escrow.createBid(max - 1, true, 1 ether, 0);
+        vm.stopPrank();
+        assertEq(escrow.nextOrderId(), 3, "exactly the two valid bids were created");
+        assertEq(sqk.balanceOf(address(escrow)), 2 ether, "nothing escrowed for the rejected bids");
     }
 
     function test_createBid_revertsDurationTooLong() public {
@@ -556,8 +733,13 @@ contract SqueekMatchEscrowBidTest is SqueekMatchEscrowTestBase {
 
     function test_fillBid_mergeReady_revertsAtMaximumLevel() public {
         uint8 max = mining.MAXIMUM_LEVEL();
+        // A merge-ready bid at the maximum level cannot be created while the maximum is `max`. If Squeekchain
+        // later lowers the maximum under an open merge-ready bid, the fill still refuses a Squeek that can no
+        // longer merge.
+        mining.setMaximumLevel(max + 1);
         vm.prank(alice);
         uint256 id = escrow.createBid(max, true, 100 ether, 0);
+        mining.setMaximumLevel(max);
         _mintSqueek(bob, 99, max);
         assertFalse(escrow.isMergeReady(99));
         vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.AtMaximumLevel.selector, 99, max));
@@ -705,7 +887,7 @@ contract SqueekMatchEscrowBidTest is SqueekMatchEscrowTestBase {
 contract SqueekMatchEscrowSwapTest is SqueekMatchEscrowTestBase {
     function test_createSwap_specificToken_makerPays() public {
         vm.expectEmit(true, true, true, true);
-        emit SqueekMatchEscrow.SwapCreated(1, alice, A1, B2, 2, false, 50 ether, 0, uint64(block.timestamp + 7 days));
+        emit SqueekMatchEscrow.SwapCreated(1, alice, A1, 1, B2, 2, false, 50 ether, 0, uint64(block.timestamp + 7 days));
         vm.prank(alice);
         uint256 id = escrow.createSwap(A1, B2, 2, false, 50 ether, 0, 0);
 
@@ -716,31 +898,57 @@ contract SqueekMatchEscrowSwapTest is SqueekMatchEscrowTestBase {
             SqueekMatchEscrow.Status status,
             uint8 wantedLevel,
             bool mergeReady,
+            uint8 makerLevel,
             uint256 makerTokenId,
             uint256 wantedTokenId,
             uint256 sqkFromMaker,
-            uint256 sqkFromTaker
+            uint256 sqkFromTaker,
+            uint256 tradeCountAt
         ) = escrow.swaps(id);
         assertEq(maker, alice);
         assertEq(expiresAt, block.timestamp + 7 days);
         assertEq(uint8(status), uint8(SqueekMatchEscrow.Status.Open));
         assertEq(wantedLevel, 2);
         assertFalse(mergeReady);
+        assertEq(makerLevel, 1, "maker Squeek's level recorded at creation");
         assertEq(makerTokenId, A1);
         assertEq(wantedTokenId, B2);
         assertEq(sqkFromMaker, 50 ether);
         assertEq(sqkFromTaker, 0);
+        assertEq(tradeCountAt, 0);
         assertEq(sqk.balanceOf(address(escrow)), 50 ether);
         assertEq(nft.ownerOf(A1), alice);
+        assertTrue(escrow.isFillable(id));
     }
 
     function test_createSwap_anyToken_takerPays_escrowsNothing() public {
         vm.prank(alice);
         uint256 id = escrow.createSwap(A2, 0, 1, true, 0, 40 ether, 10 days);
-        (, uint64 expiresAt,,,,,,, uint256 sqkFromTaker) = escrow.swaps(id);
+        (, uint64 expiresAt,,,, uint8 makerLevel,,,, uint256 sqkFromTaker,) = escrow.swaps(id);
         assertEq(expiresAt, block.timestamp + 10 days);
+        assertEq(makerLevel, 2);
         assertEq(sqkFromTaker, 40 ether);
         assertEq(sqk.balanceOf(address(escrow)), 0);
+    }
+
+    function test_createSwap_revertsWhenMakerSqueekHasNoLivePosition() public {
+        mining.clearPosition(A1);
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.NoLivePosition.selector, A1));
+        vm.prank(alice);
+        escrow.createSwap(A1, 0, 1, false, 0, 0, 0);
+    }
+
+    function test_createSwap_revertsWantedLevelNoSqueekCanHave() public {
+        uint8 max = mining.MAXIMUM_LEVEL();
+        vm.startPrank(alice);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createSwap(A1, 0, max + 1, false, 0, 0, 0);
+        vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+        escrow.createSwap(A1, 0, max, true, 0, 0, 0);
+        escrow.createSwap(A1, 0, max, false, 0, 0, 0);
+        escrow.createSwap(A1, 0, max - 1, true, 0, 0, 0);
+        vm.stopPrank();
+        assertEq(escrow.nextOrderId(), 3);
     }
 
     function test_createSwap_noDifference() public {
@@ -809,9 +1017,71 @@ contract SqueekMatchEscrowSwapTest is SqueekMatchEscrowTestBase {
         assertEq(sqk.balanceOf(bob), INITIAL_SQK + 50 ether);
         assertEq(sqk.balanceOf(alice), INITIAL_SQK - 50 ether);
         assertEq(sqk.balanceOf(address(escrow)), 0);
-        (,, SqueekMatchEscrow.Status status,,,,,,) = escrow.swaps(id);
+        (,, SqueekMatchEscrow.Status status,,,,,,,,) = escrow.swaps(id);
         assertEq(uint8(status), uint8(SqueekMatchEscrow.Status.Filled));
+        assertEq(escrow.tradeCount(A1), 1, "both Squeeks count one trade");
+        assertEq(escrow.tradeCount(B2), 1, "both Squeeks count one trade");
         _assertNoSqkLost();
+    }
+
+    function test_fillSwap_revertsWhenMakerMergedIntoTheOfferedSqueek() public {
+        vm.prank(alice);
+        uint256 id = escrow.createSwap(A1, 0, 1, false, 0, 0, 0);
+        // Alice merges A2 into A1: A1 keeps id, owner and approval but is now level 2.
+        nft.burn(A2);
+        mining.clearPosition(A2);
+        mining.setPosition(A1, 2, 0, 0);
+        assertTrue(escrow.isOpen(id));
+        assertFalse(escrow.isFillable(id));
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.LevelMismatch.selector, A1, 1, 2));
+        vm.prank(bob);
+        escrow.fillSwap(id, B1);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(nft.ownerOf(B1), bob);
+    }
+
+    function test_fillSwap_revertsAfterMakerSqueekTradedHereAndCameBack() public {
+        // Alice offers A1 for any level-1 (forgets it), sells A1 to Bob's bid, buys it back from Bob's ask.
+        vm.prank(alice);
+        uint256 oldSwap = escrow.createSwap(A1, 0, 1, false, 0, 0, 30 days);
+        vm.prank(bob);
+        uint256 bobBid = escrow.createBid(1, false, 5 ether, 0);
+        vm.prank(alice);
+        escrow.fillBid(bobBid, A1);
+        vm.prank(bob);
+        uint256 bobAsk = escrow.createAsk(A1, 6 ether, 0);
+        vm.prank(alice);
+        escrow.fillAsk(bobAsk);
+        assertEq(nft.ownerOf(A1), alice);
+        assertFalse(escrow.isFillable(oldSwap));
+
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.StaleOrder.selector, oldSwap, A1));
+        vm.prank(carol);
+        escrow.fillSwap(oldSwap, C1);
+        assertEq(nft.ownerOf(A1), alice);
+        assertEq(nft.ownerOf(C1), carol);
+    }
+
+    function test_fillSwap_deliversMakerSqueekBeforeTakerSqueek() public {
+        // A contract maker that tries to claim the offered Squeek's unclaimed SQK from its receive hook no
+        // longer owns it when the hook runs, so SqueekMining's owner rule refuses the claim.
+        ClaimingSwapMaker maker = new ClaimingSwapMaker(escrow, mining);
+        _mintSqueek(address(maker), 40, 1);
+        mining.setAccrued(40, 6230 ether);
+        vm.prank(address(maker));
+        nft.setApprovalForAll(address(escrow), true);
+        uint256 id = maker.placeSwap(40, 1);
+
+        vm.prank(bob);
+        escrow.fillSwap(id, B1);
+
+        assertTrue(maker.hookRan());
+        assertFalse(maker.claimSucceeded(), "claim from the hook must fail");
+        assertEq(bytes4(maker.claimError()), MockSqueekMining.NotOwner.selector);
+        assertEq(nft.ownerOf(40), bob);
+        assertEq(nft.ownerOf(B1), address(maker));
+        assertEq(mining.position(0, 40).accruedScaled, 6230 ether, "credit travels with the Squeek");
     }
 
     function test_fillSwap_anyToken_takerPaysDifference() public {
@@ -1033,9 +1303,73 @@ contract SqueekMatchEscrowViewTest is SqueekMatchEscrowTestBase {
         escrow.cancelSwap(s);
         vm.stopPrank();
         assertFalse(escrow.isOpen(s));
+        assertFalse(escrow.isFillable(s));
         vm.warp(block.timestamp + 1 days);
         assertTrue(escrow.isOpen(a));
+        assertTrue(escrow.isFillable(a));
         assertFalse(escrow.isOpen(b));
+        assertFalse(escrow.isFillable(b));
+    }
+
+    function test_isFillable_ask_followsTheMakerSide() public {
+        // Per-token approval only, so revoking it is visible.
+        vm.startPrank(alice);
+        nft.setApprovalForAll(address(escrow), false);
+        nft.approve(address(escrow), A1);
+        uint256 id = escrow.createAsk(A1, 1, 30 days);
+        assertTrue(escrow.isFillable(id));
+
+        // Approval revoked: still Open, not fillable, and the fill reverts the same way.
+        nft.approve(address(0), A1);
+        vm.stopPrank();
+        assertTrue(escrow.isOpen(id));
+        assertFalse(escrow.isFillable(id));
+        vm.expectRevert(abi.encodeWithSelector(SqueekMatchEscrow.EscrowNotApproved.selector, A1, alice));
+        vm.prank(bob);
+        escrow.fillAsk(id);
+
+        // Approval restored: fillable again (the token never moved and its level is unchanged).
+        vm.prank(alice);
+        nft.approve(address(escrow), A1);
+        assertTrue(escrow.isFillable(id));
+
+        // Moved away outside the escrow: not fillable.
+        vm.prank(alice);
+        nft.transferFrom(alice, carol, A1);
+        assertFalse(escrow.isFillable(id));
+
+        // Burned: ownerOf reverts, the view reports false rather than reverting.
+        nft.burn(A1);
+        assertFalse(escrow.isFillable(id));
+    }
+
+    function test_isFillable_swap_followsTheMakerSide() public {
+        vm.prank(alice);
+        uint256 id = escrow.createSwap(A2, 0, 1, false, 0, 0, 0);
+        assertTrue(escrow.isFillable(id));
+        vm.prank(alice);
+        nft.setApprovalForAll(address(escrow), false);
+        assertFalse(escrow.isFillable(id));
+        vm.prank(alice);
+        nft.setApprovalForAll(address(escrow), true);
+        assertTrue(escrow.isFillable(id));
+        mining.setPosition(A2, 3, 0, 0);
+        assertFalse(escrow.isFillable(id), "level changed");
+        mining.setPosition(A2, 2, 0, 0);
+        assertTrue(escrow.isFillable(id));
+        vm.warp(block.timestamp + 7 days);
+        assertFalse(escrow.isFillable(id), "expired");
+    }
+
+    function test_isFillable_bid_equalsIsOpen_andUnknownIdsAreFalse() public {
+        vm.prank(alice);
+        uint256 b = escrow.createBid(1, true, 1 ether, 0);
+        assertTrue(escrow.isFillable(b));
+        vm.prank(alice);
+        escrow.cancelBid(b);
+        assertFalse(escrow.isFillable(b));
+        assertFalse(escrow.isFillable(0));
+        assertFalse(escrow.isFillable(99));
     }
 
     function test_levelOfAndIsMergeReady() public {
@@ -1135,7 +1469,7 @@ contract SqueekMatchEscrowFuzzTest is SqueekMatchEscrowTestBase {
             return;
         }
         uint256 id = escrow.createAsk(A1, 1, duration);
-        (, uint64 expiresAt,,,) = escrow.asks(id);
+        (, uint64 expiresAt,,,,,) = escrow.asks(id);
         uint64 expected = uint64(block.timestamp) + (duration == 0 ? 7 days : duration);
         assertEq(expiresAt, expected);
         vm.warp(expected - 1);
@@ -1211,7 +1545,14 @@ contract SqueekMatchEscrowFuzzTest is SqueekMatchEscrowTestBase {
         bool expected = pendingRound == 0 && level < mining.MAXIMUM_LEVEL() && nextMergeBlock <= height;
         assertEq(escrow.isMergeReady(B1), expected);
 
+        bool atMaximum = level == mining.MAXIMUM_LEVEL();
         vm.prank(alice);
+        if (atMaximum) {
+            // No Squeek at the maximum level can merge, so the bid itself is refused.
+            vm.expectRevert(SqueekMatchEscrow.InvalidLevel.selector);
+            escrow.createBid(level, true, 1 ether, 0);
+            return;
+        }
         uint256 id = escrow.createBid(level, true, 1 ether, 0);
         vm.prank(bob);
         if (!expected) vm.expectRevert();

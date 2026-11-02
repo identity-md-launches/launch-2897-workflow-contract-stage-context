@@ -22,6 +22,12 @@ import {ISqueekCore, ISqueekMining, ISqueekNFT} from "./interfaces/ISqueekchain.
 /// anyone may cancel, which refunds escrowed SQK to the maker. Level and merge eligibility are read from
 /// the live Squeekchain contracts at fill. There is no owner, no fee, no upgrade path and no pause.
 ///
+/// An ask or swap is bound to the Squeek as it was when listed: its level is recorded at creation and the
+/// fill reverts with LevelMismatch if the live level differs (a merge raises the survivor's level without
+/// any ERC-721 transfer, so the approval alone would not catch it), and the fill reverts with StaleOrder if
+/// the Squeek has changed hands through this escrow since the order was created (so an old order does not
+/// revive when the Squeek returns to its maker under a standing setApprovalForAll).
+///
 /// @dev The contract never holds Squeeks, only the SQK that bid and swap makers escrow. It is reentrancy
 /// guarded and follows checks-effects-interactions: an order is marked Filled or Cancelled before any
 /// token moves. SQK is Squeekchain's fixed 18-decimal token with no transfer fee.
@@ -50,8 +56,10 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         address maker;
         uint64 expiresAt;
         Status status;
+        uint8 level; // level the Squeek had when listed; the fill requires the live level to be the same
         uint256 tokenId;
         uint256 price; // SQK base units the taker pays the maker
+        uint256 tradeCount; // tradeCount[tokenId] when listed; the fill requires it unchanged
     }
 
     struct Bid {
@@ -69,10 +77,12 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         Status status;
         uint8 wantedLevel; // exact level the taker's Squeek must have at fill
         bool mergeReady; // when true, the taker's Squeek must pass the on-chain merge-ready check
+        uint8 makerLevel; // level makerTokenId had when offered; the fill requires the live level to be the same
         uint256 makerTokenId; // the Squeek the maker gives (stays in the maker's wallet until fill)
         uint256 wantedTokenId; // a specific Squeek the maker wants, or ANY_SQUEEK (0)
         uint256 sqkFromMaker; // SQK the maker adds, escrowed here and paid to the taker
         uint256 sqkFromTaker; // SQK the taker adds, paid straight to the maker at fill
+        uint256 tradeCount; // tradeCount[makerTokenId] when offered; the fill requires it unchanged
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -104,13 +114,23 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     mapping(uint256 orderId => Ask) public asks;
     mapping(uint256 orderId => Bid) public bids;
     mapping(uint256 orderId => Swap) public swaps;
+    /// @notice How many times a Squeek has changed hands through this escrow (every fill that moves it adds
+    /// one). Asks and swaps record it at creation and cannot fill once it has changed, so an order made in an
+    /// earlier period of ownership dies when the Squeek is traded here. A transfer made outside this escrow
+    /// does not count: cancel such orders yourself.
+    mapping(uint256 tokenId => uint256) public tradeCount;
 
     // ---------------------------------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------------------------------
 
     event AskCreated(
-        uint256 indexed askId, address indexed maker, uint256 indexed tokenId, uint256 price, uint64 expiresAt
+        uint256 indexed askId,
+        address indexed maker,
+        uint256 indexed tokenId,
+        uint8 level,
+        uint256 price,
+        uint64 expiresAt
     );
     event AskFilled(
         uint256 indexed askId, address indexed taker, address indexed maker, uint256 tokenId, uint256 price
@@ -134,6 +154,7 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         uint256 indexed swapId,
         address indexed maker,
         uint256 indexed makerTokenId,
+        uint8 makerLevel,
         uint256 wantedTokenId,
         uint8 wantedLevel,
         bool mergeReady,
@@ -167,6 +188,7 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     error NotMakerAndNotExpired(uint256 orderId);
     error SelfTrade();
     error MakerNoLongerOwns(uint256 orderId, uint256 tokenId);
+    error StaleOrder(uint256 orderId, uint256 tokenId);
     error SameToken();
     error BothSidesPaySqk();
     error WrongToken(uint256 wanted, uint256 offered);
@@ -193,34 +215,45 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     // Asks: sell one wallet-held Squeek for SQK
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice List `tokenId`, which stays in your wallet, for `price` SQK.
-    /// @param tokenId Squeek you own and have approved this contract to transfer.
+    /// @notice List `tokenId`, which stays in your wallet, for `price` SQK. The Squeek's current level is part
+    /// of the listing: if you merge into it (or it is otherwise changed) before the fill, the ask cannot fill.
+    /// @param tokenId Squeek you own and have approved this contract to transfer, with a live mining position.
     /// @param price SQK base units the buyer pays you. Must be > 0.
     /// @param duration Seconds until expiry; 0 means DEFAULT_DURATION, at most MAX_DURATION.
     function createAsk(uint256 tokenId, uint256 price, uint64 duration) external nonReentrant returns (uint256 askId) {
         if (price == 0) revert ZeroAmount();
         _requireOwnerAndApproval(tokenId, msg.sender);
+        uint8 level = _requireLiveLevel(tokenId);
         uint64 expiresAt = _expiry(duration);
 
         askId = _nextId(Kind.Ask);
-        asks[askId] =
-            Ask({maker: msg.sender, expiresAt: expiresAt, status: Status.Open, tokenId: tokenId, price: price});
-        emit AskCreated(askId, msg.sender, tokenId, price, expiresAt);
+        asks[askId] = Ask({
+            maker: msg.sender,
+            expiresAt: expiresAt,
+            status: Status.Open,
+            level: level,
+            tokenId: tokenId,
+            price: price,
+            tradeCount: tradeCount[tokenId]
+        });
+        emit AskCreated(askId, msg.sender, tokenId, level, price, expiresAt);
     }
 
     /// @notice Buy the Squeek of ask `askId`: you pay the maker its price in SQK and receive the Squeek.
-    /// @dev You must have approved this contract for at least `price` SQK.
+    /// @dev You must have approved this contract for at least `price` SQK. Reverts unless the maker still owns
+    /// the Squeek, this contract is still approved for it, it has not been traded through this escrow since the
+    /// listing, and its live level is the listed one.
     function fillAsk(uint256 askId) external nonReentrant {
         Ask storage ask = asks[askId];
         _requireOpen(askId, ask.status, ask.expiresAt);
         address maker = ask.maker;
         if (msg.sender == maker) revert SelfTrade();
         uint256 tokenId = ask.tokenId;
-        if (SQUEEK.ownerOf(tokenId) != maker) revert MakerNoLongerOwns(askId, tokenId);
-        if (!_escrowApproved(tokenId, maker)) revert EscrowNotApproved(tokenId, maker);
+        _requireMakerSqueek(askId, tokenId, maker, ask.level, ask.tradeCount);
         uint256 price = ask.price;
 
         ask.status = Status.Filled;
+        ++tradeCount[tokenId];
         emit AskFilled(askId, msg.sender, maker, tokenId, price);
 
         SQK.safeTransferFrom(msg.sender, maker, price);
@@ -241,7 +274,8 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Escrow `amount` SQK to buy any Squeek at exactly `level`.
-    /// @param level Level the delivered Squeek must have at fill (1..maximum level).
+    /// @param level Level the delivered Squeek must have at fill (1..maximum level, read from SqueekMining; a
+    /// merge-ready bid must be below the maximum level, since a Squeek at the maximum cannot merge).
     /// @param mergeReady When true the delivered Squeek must also be merge-ready at fill: below the maximum
     /// level, no scheduled power change, and its merge cooldown reached at SqueekCore's completed height.
     /// @param amount SQK base units escrowed now and paid to whoever fills the bid. Must be > 0.
@@ -252,7 +286,7 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         returns (uint256 bidId)
     {
         if (amount == 0) revert ZeroAmount();
-        if (level == 0) revert InvalidLevel();
+        _requireFillableLevel(level, mergeReady);
         uint64 expiresAt = _expiry(duration);
 
         bidId = _nextId(Kind.Bid);
@@ -282,6 +316,7 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         uint256 amount = bid.amount;
 
         bid.status = Status.Filled;
+        ++tradeCount[tokenId];
         emit BidFilled(bidId, msg.sender, tokenId, maker, amount);
 
         SQUEEK.safeTransferFrom(msg.sender, maker, tokenId);
@@ -308,9 +343,11 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Offer `makerTokenId` (stays in your wallet) for another Squeek, plus an optional SQK difference.
-    /// @param makerTokenId Squeek you own and have approved this contract to transfer.
+    /// Its current level is part of the offer: if it changes before the fill, the swap cannot fill.
+    /// @param makerTokenId Squeek you own and have approved this contract to transfer, with a live position.
     /// @param wantedTokenId A specific Squeek you want, or ANY_SQUEEK (0) for any Squeek at `wantedLevel`.
-    /// @param wantedLevel Level the delivered Squeek must have at fill (1..maximum level); always checked.
+    /// @param wantedLevel Level the delivered Squeek must have at fill (1..maximum level, read from SqueekMining;
+    /// below the maximum when `mergeReady`); always checked.
     /// @param mergeReady When true the delivered Squeek must also be merge-ready at fill.
     /// @param sqkFromMaker SQK you add on top of your Squeek; escrowed now, paid to the taker at fill.
     /// @param sqkFromTaker SQK the taker must add; paid straight to you at fill. Not both > 0.
@@ -324,10 +361,11 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         uint256 sqkFromTaker,
         uint64 duration
     ) external nonReentrant returns (uint256 swapId) {
-        if (wantedLevel == 0) revert InvalidLevel();
+        _requireFillableLevel(wantedLevel, mergeReady);
         if (wantedTokenId == makerTokenId) revert SameToken();
         if (sqkFromMaker != 0 && sqkFromTaker != 0) revert BothSidesPaySqk();
         _requireOwnerAndApproval(makerTokenId, msg.sender);
+        uint8 makerLevel = _requireLiveLevel(makerTokenId);
         uint64 expiresAt = _expiry(duration);
 
         swapId = _nextId(Kind.Swap);
@@ -337,15 +375,18 @@ contract SqueekMatchEscrow is ReentrancyGuard {
             status: Status.Open,
             wantedLevel: wantedLevel,
             mergeReady: mergeReady,
+            makerLevel: makerLevel,
             makerTokenId: makerTokenId,
             wantedTokenId: wantedTokenId,
             sqkFromMaker: sqkFromMaker,
-            sqkFromTaker: sqkFromTaker
+            sqkFromTaker: sqkFromTaker,
+            tradeCount: tradeCount[makerTokenId]
         });
         emit SwapCreated(
             swapId,
             msg.sender,
             makerTokenId,
+            makerLevel,
             wantedTokenId,
             wantedLevel,
             mergeReady,
@@ -360,7 +401,11 @@ contract SqueekMatchEscrow is ReentrancyGuard {
     /// @notice Fill swap `swapId` with your Squeek `tokenId`: the two Squeeks change hands and the SQK
     /// difference, if any, is paid.
     /// @dev You must own `tokenId` and have approved this contract for it, and, when the swap asks for SQK
-    /// from the taker, have approved this contract for that amount of SQK.
+    /// from the taker, have approved this contract for that amount of SQK. Reverts unless the maker still owns
+    /// `makerTokenId`, this contract is still approved for it, it has not been traded through this escrow since
+    /// the offer, and its live level is the offered one. The maker's Squeek is delivered to you before yours
+    /// is delivered to the maker, so a contract maker cannot claim its unclaimed SQK from its receive hook while
+    /// it still owns it; its SQK credit is otherwise not part of the trade.
     function fillSwap(uint256 swapId, uint256 tokenId) external nonReentrant {
         Swap storage swap_ = swaps[swapId];
         _requireOpen(swapId, swap_.status, swap_.expiresAt);
@@ -369,19 +414,20 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         uint256 wanted = swap_.wantedTokenId;
         if (wanted != ANY_SQUEEK && wanted != tokenId) revert WrongToken(wanted, tokenId);
         uint256 makerTokenId = swap_.makerTokenId;
-        if (SQUEEK.ownerOf(makerTokenId) != maker) revert MakerNoLongerOwns(swapId, makerTokenId);
-        if (!_escrowApproved(makerTokenId, maker)) revert EscrowNotApproved(makerTokenId, maker);
+        _requireMakerSqueek(swapId, makerTokenId, maker, swap_.makerLevel, swap_.tradeCount);
         _requireOwnerAndApproval(tokenId, msg.sender);
         _requireMatches(tokenId, swap_.wantedLevel, swap_.mergeReady);
         uint256 sqkFromMaker = swap_.sqkFromMaker;
         uint256 sqkFromTaker = swap_.sqkFromTaker;
 
         swap_.status = Status.Filled;
+        ++tradeCount[makerTokenId];
+        ++tradeCount[tokenId];
         emit SwapFilled(swapId, msg.sender, tokenId, maker, makerTokenId, sqkFromMaker, sqkFromTaker);
 
         if (sqkFromTaker != 0) SQK.safeTransferFrom(msg.sender, maker, sqkFromTaker);
-        SQUEEK.safeTransferFrom(msg.sender, maker, tokenId);
         SQUEEK.safeTransferFrom(maker, msg.sender, makerTokenId);
+        SQUEEK.safeTransferFrom(msg.sender, maker, tokenId);
         if (sqkFromMaker != 0) SQK.safeTransfer(msg.sender, sqkFromMaker);
     }
 
@@ -424,12 +470,34 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         return pos.nextMergeBlock <= ISqueekCore(m.core()).state().blockHeight;
     }
 
-    /// @notice Whether an order of any kind is open and not yet expired.
+    /// @notice Whether an order of any kind is open and not yet expired. For asks and swaps this says nothing
+    /// about the maker's side; use `isFillable` to filter out orders no taker could fill.
     function isOpen(uint256 orderId) external view returns (bool) {
         Kind kind = kindOf[orderId];
         if (kind == Kind.Ask) return _isOpen(asks[orderId].status, asks[orderId].expiresAt);
         if (kind == Kind.Bid) return _isOpen(bids[orderId].status, bids[orderId].expiresAt);
         if (kind == Kind.Swap) return _isOpen(swaps[orderId].status, swaps[orderId].expiresAt);
+        return false;
+    }
+
+    /// @notice Whether an order is open and its maker's side could settle right now: for an ask or swap, the
+    /// maker still owns the Squeek, this contract is approved for it, it has not been traded here since the
+    /// order was created, and its live level is the recorded one. For a bid it equals `isOpen`, since a bid's
+    /// fillability depends only on the Squeek a taker brings. A taker's own token, balance and allowance are
+    /// not checked here; an `eth_call` dry run of the fill is.
+    function isFillable(uint256 orderId) external view returns (bool) {
+        Kind kind = kindOf[orderId];
+        if (kind == Kind.Ask) {
+            Ask storage ask = asks[orderId];
+            return _isOpen(ask.status, ask.expiresAt)
+                && _makerSqueekFillable(ask.tokenId, ask.maker, ask.level, ask.tradeCount);
+        }
+        if (kind == Kind.Bid) return _isOpen(bids[orderId].status, bids[orderId].expiresAt);
+        if (kind == Kind.Swap) {
+            Swap storage swap_ = swaps[orderId];
+            return _isOpen(swap_.status, swap_.expiresAt)
+                && _makerSqueekFillable(swap_.makerTokenId, swap_.maker, swap_.makerLevel, swap_.tradeCount);
+        }
         return false;
     }
 
@@ -471,6 +539,50 @@ contract SqueekMatchEscrow is ReentrancyGuard {
         address owner = SQUEEK.ownerOf(tokenId);
         if (owner != account) revert NotTokenOwner(tokenId, owner);
         if (!_escrowApproved(tokenId, owner)) revert EscrowNotApproved(tokenId, owner);
+    }
+
+    /// @dev The Squeek's live level from SqueekMining; reverts if it has no live position.
+    function _requireLiveLevel(uint256 tokenId) private view returns (uint8 level) {
+        level = mining().position(SQUEEKS_COLLECTION, tokenId).level;
+        if (level == 0) revert NoLivePosition(tokenId);
+    }
+
+    /// @dev Reverts unless some Squeek could satisfy `level` / `mergeReady`: 1..maximumLevel, and below the
+    /// maximum when merge readiness is required (a Squeek at the maximum level cannot merge).
+    function _requireFillableLevel(uint8 level, bool mergeReady) private view {
+        if (level == 0) revert InvalidLevel();
+        uint8 maximumLevel = mining().collectionPolicy(SQUEEKS_COLLECTION).maximumLevel;
+        if (level > maximumLevel || (mergeReady && level >= maximumLevel)) revert InvalidLevel();
+    }
+
+    /// @dev The maker-side checks of fillAsk and fillSwap: the maker still owns `tokenId`, it has not been traded
+    /// through this escrow since the order was created, this contract is approved for it, and its live level is
+    /// the one recorded at creation.
+    function _requireMakerSqueek(uint256 orderId, uint256 tokenId, address maker, uint8 level, uint256 tradeCountAt)
+        private
+        view
+    {
+        if (SQUEEK.ownerOf(tokenId) != maker) revert MakerNoLongerOwns(orderId, tokenId);
+        if (tradeCount[tokenId] != tradeCountAt) revert StaleOrder(orderId, tokenId);
+        if (!_escrowApproved(tokenId, maker)) revert EscrowNotApproved(tokenId, maker);
+        uint8 live = mining().position(SQUEEKS_COLLECTION, tokenId).level;
+        if (live != level) revert LevelMismatch(tokenId, level, live);
+    }
+
+    /// @dev Non-reverting form of `_requireMakerSqueek` for `isFillable`; a burned Squeek reports false.
+    function _makerSqueekFillable(uint256 tokenId, address maker, uint8 level, uint256 tradeCountAt)
+        private
+        view
+        returns (bool)
+    {
+        try SQUEEK.ownerOf(tokenId) returns (address owner) {
+            if (owner != maker) return false;
+        } catch {
+            return false;
+        }
+        if (tradeCount[tokenId] != tradeCountAt) return false;
+        if (!_escrowApproved(tokenId, maker)) return false;
+        return mining().position(SQUEEKS_COLLECTION, tokenId).level == level;
     }
 
     /// @dev Reads the Squeek's live position and reverts unless it is at `level` and, when `mergeReady` is

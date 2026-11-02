@@ -33,7 +33,11 @@ contract MockSqueekMining is ISqueekMining {
 
     address public immutable core;
     address public nft;
+    /// @dev The policy's maximum level; starts at MAXIMUM_LEVEL and can be moved to model a governance change.
+    uint8 public maximumLevel = MAXIMUM_LEVEL;
     mapping(uint8 => mapping(uint256 => MiningPosition)) internal positions;
+
+    error NotOwner(uint256 tokenId);
 
     constructor(address core_) {
         core = core_;
@@ -41,6 +45,24 @@ contract MockSqueekMining is ISqueekMining {
 
     function setNft(address nft_) external {
         nft = nft_;
+    }
+
+    function setMaximumLevel(uint8 maximumLevel_) external {
+        maximumLevel = maximumLevel_;
+    }
+
+    /// @dev Unclaimed SQK credit of a position, as SqueekMining tracks it per token.
+    function setAccrued(uint256 tokenId, uint256 accruedScaled) external {
+        positions[0][tokenId].accruedScaled = accruedScaled;
+    }
+
+    /// @dev Mirrors SqueekMining.claim's owner rule ("approvals are not enough"): only the current owner may
+    /// claim, and claiming zeroes the credit. Payment of SQK is not modelled; the test reads the credit.
+    function claim(uint8 collection, uint256[] calldata tokenIds) external {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            if (ERC721(nft).ownerOf(tokenIds[i]) != msg.sender) revert NotOwner(tokenIds[i]);
+            positions[collection][tokenIds[i]].accruedScaled = 0;
+        }
     }
 
     function setPosition(uint256 tokenId, uint8 level, uint40 pendingRound, uint48 nextMergeBlock) external {
@@ -67,7 +89,7 @@ contract MockSqueekMining is ISqueekMining {
         require(collection == 0, "CollectionNotBound");
         policy.nft = nft;
         policy.maxSupply = 9999;
-        policy.maximumLevel = MAXIMUM_LEVEL;
+        policy.maximumLevel = maximumLevel;
         policy.levels = new MiningLevel[](MAXIMUM_LEVEL);
         for (uint8 i; i < MAXIMUM_LEVEL; ++i) {
             policy.levels[i] =

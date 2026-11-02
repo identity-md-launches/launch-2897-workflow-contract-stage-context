@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SqueekMatchEscrow} from "../../src/SqueekMatchEscrow.sol";
+import {MockSqueekMining} from "./SqueekchainMocks.sol";
 
 /// @notice A taker contract that, while receiving the Squeek of one ask, tries to re-enter the escrow.
 /// It swallows the failure so the outer fill can finish and the test can read what happened.
@@ -82,6 +83,42 @@ contract ReentrantSwapMaker is IERC721Receiver {
             reentrySucceeded = true;
         } catch (bytes memory err) {
             reentryError = err;
+        }
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}
+
+/// @notice A swap maker contract that, in the receive hook for the taker's Squeek, tries to claim the unclaimed
+/// SQK credit of the Squeek it is giving away. With the maker's Squeek delivered first, it no longer owns it
+/// when the hook runs, so SqueekMining's owner rule rejects the claim. The failure is recorded, not propagated.
+contract ClaimingSwapMaker is IERC721Receiver {
+    SqueekMatchEscrow public immutable escrow;
+    MockSqueekMining public immutable mining;
+    uint256 public swapId;
+    uint256 public givenTokenId;
+    bool public hookRan;
+    bool public claimSucceeded;
+    bytes public claimError;
+
+    constructor(SqueekMatchEscrow escrow_, MockSqueekMining mining_) {
+        escrow = escrow_;
+        mining = mining_;
+    }
+
+    function placeSwap(uint256 makerTokenId, uint8 wantedLevel) external returns (uint256 id) {
+        givenTokenId = makerTokenId;
+        id = escrow.createSwap(makerTokenId, 0, wantedLevel, false, 0, 0, 0);
+        swapId = id;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
+        hookRan = true;
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = givenTokenId;
+        try mining.claim(0, ids) {
+            claimSucceeded = true;
+        } catch (bytes memory err) {
+            claimError = err;
         }
         return IERC721Receiver.onERC721Received.selector;
     }
